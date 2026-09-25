@@ -43,6 +43,34 @@ Both modes replay the conversation since Codex's last compaction. If that part i
 - Injected context (AGENTS.md, environment and permission blocks, developer instructions) is dropped. Claude Code supplies its own.
 - Subagent and guardian threads are skipped. Pass `--include-subagents` to import them.
 
+## Comparison with other tools
+
+These are the other tools that move Codex sessions into Claude Code. The table covers only the Codex → Claude direction and is based on reading each tool's source in September 2026. They may have changed since, so check the linked repos for current behaviour.
+
+| | **codex2claude** (this) | [transession](https://github.com/inmzhang/transession) + [MisterBrookT/codex2claude](https://github.com/MisterBrookT/codex2claude) | [session-migrate](https://github.com/xhluca/session-migrate) | [cross_agent_session_resumer](https://github.com/Dicklesworthstone/cross_agent_session_resumer) | [resume-from](https://github.com/alexei-led/resume-from) | [sessionbridge](https://tongtongtju.github.io/sessionbridge/) | [cli-continues](https://github.com/yigitkonur/cli-continues) |
+|---|---|---|---|---|---|---|---|
+| Creates a native, resumable Claude session | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ only with `--new-session`; by default pastes a summary into the current chat | ❌ Markdown handoff prompt |
+| Sessions with millions of tokens fit in context on resume | ✅ boundary placed by token budget | ❌ replays the full history | ❌ replays the full history | ⚠️ resets to Codex's compacted history, but drops the earlier history | ⚠️ silently drops the oldest turns beyond ~60k tokens | ❌ | ⚠️ keeps only the last ~10 messages |
+| Earlier history kept and searchable | ✅ full transcript + prompt index | ✅ in the session file | ✅ in the session file | ❌ | ❌ | ❌ | ❌ |
+| Optional Claude-written summary | ✅ `--mode claude` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Tool calls and outputs | ✅ | ✅ | ✅ | ✅ | ⚠️ one-line text; outputs dropped | ⚠️ renamed to Bash/Edit; ordering can break | ⚠️ one-line summaries |
+| Reasoning summaries | ✅ | ⚠️ only where stored on the reasoning record | ❌ | ⚠️ partial | ❌ | ❌ | ⚠️ first lines only |
+| Inter-agent (subagent) messages | ✅ encrypted payloads recovered from subagent transcripts | ❌ | ❌ (reported as dropped) | ⚠️ only if plain text | ✅ text only | ❌ | ⚠️ fallback only |
+| Images | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Multi-file ("paginated") threads and forks | ✅ segments merged; forks linked to parent | – | ⚠️ rejects paginated subagent histories | – | – | – | – |
+| Codex worktrees mapped back to the real project | ✅ | ❌ | ⚠️ manual `--cwd` override | ❌ | ❌ | ❌ | ❌ |
+| Bulk import | ✅ `--project` / `--all` | ✅ (wrapper) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Skips subagent / guardian threads | ✅ | ❌ | ⚠️ flagged in its listing only | ❌ | ❌ | ❌ | ❌ |
+| Keeps Codex thread titles | ✅ | ⚠️ titled from the first prompt, not the Codex thread name | – | – | – | – | – |
+| Readable HTML chat history | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Claude desktop app sidebar | ✅ `--desktop` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Never overwrites existing files | ✅ (`--force` archives first) | ✅ | ✅ | ✅ (`--force` backs up) | ✅ | ✅ | ⚠️ overwrites its handoff file |
+| Runtime | Python 3.9+, no dependencies | Rust + Python | Python 3.11+ | Rust | Node ≥ 24 | Node (runs `npm install` on each call) | Node ≥ 22.5 |
+
+"–" means the reviewed source did not show clearly either way.
+
+Several of those tools also convert in other directions (Claude → Codex, or between many agents), which this tool does not.
+
 ## Output
 
 - `~/.claude/projects/<project>/<session>.jsonl` is the Claude Code session. Session ids are deterministic, so re-running skips threads that are already imported. `--force` re-imports and moves the old file to `_archive/`.
