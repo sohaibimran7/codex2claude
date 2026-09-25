@@ -83,6 +83,7 @@ def load_db() -> dict[str, dict]:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     rows = {r["id"]: dict(r) for r in db.execute("select * from threads")}
+    _KNOWN_CWDS[:] = sorted({r["cwd"] for r in rows.values() if r.get("cwd")})
     try:
         for r in db.execute("select parent_thread_id, child_thread_id from thread_spawn_edges"):
             rows.setdefault(r[0], {}).setdefault("_children", []).append(r[1])
@@ -845,6 +846,9 @@ def encode_project(cwd: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
+_KNOWN_CWDS: list[str] = []  # filled from the Codex thread index
+
+
 def resolve_cwd(cwd: str | None, row: dict) -> str:
     """Map Codex worktrees (~/.codex/worktrees/<id>/<repo>) back to the main checkout."""
     if not cwd:
@@ -858,6 +862,10 @@ def resolve_cwd(cwd: str | None, row: dict) -> str:
         if m and Path(m.group(1)).is_dir():
             return m.group(1)
     name = Path(cwd).name
+    # the worktree is gone: prefer a real folder of the same name that other Codex threads used
+    for other in _KNOWN_CWDS:
+        if Path(other).name == name and not other.startswith(wt_root) and Path(other).is_dir():
+            return other
     for cand in [HOME / name, *[Path(p) / name for p in glob.glob(str(HOME / "*")) if Path(p).is_dir()]]:
         if (cand / ".git").exists():
             return str(cand)
