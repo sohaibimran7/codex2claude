@@ -18,11 +18,26 @@ python3 codex2claude.py --project ~/my-project --mode claude --desktop
 python3 codex2claude.py <codex-thread-id>
 python3 codex2claude.py --all --desktop
 
+# bring earlier imports up to date (see "Resync" below); --plan only shows what would happen
+python3 codex2claude.py --resync --plan --desktop
+python3 codex2claude.py --resync --desktop
+
 # dry run into a folder, leaving ~/.claude untouched
 python3 codex2claude.py --project ~/my-project --out /tmp/codex-dry
 ```
 
 Resume from the project folder with `claude -r <session-id>` (the id is printed in each JSON result line). With `--desktop`, restart the Claude app and the imports appear in the sidebar with a `[Codex]` prefix.
+
+## Resync
+
+`--resync` revisits every earlier import (from `manifest.jsonl`) and imports new top-level threads in the same project folders. Imports keep the folder they were filed under, including manual moves. For each import:
+
+- **The Codex thread has no new activity:** the import is left alone.
+- **The thread has new activity, and nobody touched the Claude chat:** it is re-imported. The old file is moved to `_archive/`.
+- **The Claude chat is open right now, or was continued in Claude:** the chat is **never modified**. The newer Codex history goes into a **separate chat** titled `… (Codex update <date>)`, whose first message links back to the original. Local slash commands such as `/context` don't count as continuing.
+  - Each copy's id comes from a fingerprint of the Codex source, so later resyncs don't duplicate it until Codex changes again.
+  - When Codex does change again, the next copy replaces the previous copy, but only if nobody continued or opened that copy.
+  - Copies are recorded in the manifest with `kind: "branch"`, `branch_of` and `fingerprint`.
 
 ## Modes
 

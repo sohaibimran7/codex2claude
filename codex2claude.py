@@ -1019,8 +1019,12 @@ def convert(thread_id: str, db: dict, args, log) -> dict:
     cwd = args.cwd or resolve_cwd(row.get("cwd") or meta.get("cwd"), row)
     title_raw = row.get("name") or row.get("title") or next(
         (blocks_text(i.data["blocks"])[:80] for i in items if i.kind == "user"), thread_id)
+    branch = getattr(args, "branch", None)
     title = f"{args.title_prefix}{title_raw}"
     session_id = str(uuid.uuid5(NAMESPACE, "codex:" + thread_id))
+    if branch:  # a separate copy with newer Codex history; the original chat is left alone
+        session_id = str(uuid.uuid5(NAMESPACE, f"codex:{thread_id}:branch:{branch['fingerprint']}"))
+        title = f"{title} (Codex update {datetime.now().strftime('%-d %b')})"
     proj = encode_project(cwd)
     out_root = Path(args.out) if args.out else CLAUDE_HOME
     md_path = (Path(args.out) if args.out else CLAUDE_HOME) / "codex-imports" / proj / f"{thread_id}.md"
@@ -1084,6 +1088,11 @@ def convert(thread_id: str, db: dict, args, log) -> dict:
               f"**[Open the full chat history]({html_path})**: every message from Codex, including the parts "
               f"that aren't loaded into Claude's context. Claude searches the raw transcript `{md_path}` when it "
               "needs earlier details.")
+    if branch:
+        header = (f"🔀 **Updated copy of a Codex thread.** The earlier import, *{branch['of_title']}*, was continued "
+                  "in Claude, so it was left unchanged and this separate chat holds the newer Codex history. "
+                  + (f"[Open the Claude-continued chat]({desktop_link(thread_id)})" if args.desktop else
+                     f"The Claude-continued chat is session `{branch['of_session']}`.") + "\n\n" + header)
     if parent:
         prow = db.get(parent, {})
         pname = prow.get("name") or prow.get("title") or parent
@@ -1125,6 +1134,8 @@ def convert(thread_id: str, db: dict, args, log) -> dict:
               "total_tokens_est": total_tok, "resume_tokens_est": resume_tok,
               "boundaries": sum(1 for r in recs if r.get("subtype") == "compact_boundary"),
               "problems": problems, "stats": stats, "imported_at": datetime.now(timezone.utc).isoformat()}
+    if branch:
+        result.update(kind="branch", branch_of=branch["of_session"], fingerprint=branch["fingerprint"])
     if not args.out:
         with open(manifest, "a") as fh:
             fh.write(json.dumps(result) + "\n")
@@ -1145,7 +1156,8 @@ def register_desktop(result: dict, row: dict, args) -> str | None:
     folder = desktop_dir(args.desktop_dir)
     if folder is None:
         return None
-    sid = "local_" + str(uuid.uuid5(NAMESPACE, "desktop:" + result["thread"]))
+    key = result["session"] if result.get("kind") == "branch" else result["thread"]
+    sid = "local_" + str(uuid.uuid5(NAMESPACE, "desktop:" + key))
     path = folder / f"{sid}.json"
     if path.exists() and not args.force:
         return str(path)
@@ -1184,6 +1196,149 @@ def select_threads(db: dict, args) -> list[str]:
     return [t for _, t in sorted(ids, reverse=True)]
 
 
+# --------------------------------------------------------------------------- resync
+
+def latest_imports(kind: str = "original") -> dict:
+    """original: Codex thread id -> its most recent successful import.
+    branch: Codex thread id -> {fingerprint: most recent branch entry}."""
+    out: dict = {}
+    try:
+        with open(CLAUDE_HOME / "codex-imports" / "manifest.jsonl") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("status") != "ok":
+                    continue
+                if kind == "original" and r.get("kind") != "branch":
+                    out[r["thread"]] = r
+                elif kind == "branch" and r.get("kind") == "branch":
+                    out.setdefault(r["thread"], {})[r["fingerprint"]] = r
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def claude_only_turns(path: str, session_id: str) -> int:
+    """Messages in an imported session that the importer did not write (turns added in Claude)."""
+    lines = Path(path).read_text().splitlines()
+    ours = {str(uuid.uuid5(NAMESPACE, f"{session_id}:{i}")) for i in range(len(lines) + 1)}
+    n = 0
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("type") in ("user", "assistant") and r.get("uuid") and r["uuid"] not in ours and not r.get("isMeta"):
+            c = (r.get("message") or {}).get("content")
+            if isinstance(c, str) and c.lstrip().startswith(("<command-name>", "<local-command")):
+                continue  # a local slash command such as /context, not a conversation turn
+            n += 1
+    return n
+
+
+def session_is_open(session_id: str) -> bool:
+    for f in (CLAUDE_HOME / "sessions").glob("*.json"):
+        try:
+            rec = json.loads(f.read_text())
+            if rec.get("sessionId") == session_id:
+                os.kill(int(rec["pid"]), 0)
+                return True
+        except (ValueError, OSError, KeyError, TypeError):
+            continue
+    return False
+
+
+def codex_changed_since(thread_id: str, iso: str) -> bool:
+    try:
+        t0 = datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return True
+    return any(f.stat().st_mtime > t0 for f in rollout_files(thread_id))
+
+
+def source_fingerprint(thread_id: str) -> str:
+    import hashlib
+    parts = [f"{p.name}:{p.stat().st_size}" for p in rollout_files(thread_id)]
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+def resync(db: dict, args, log) -> None:
+    """Bring earlier imports up to date without clobbering anything done in Claude since."""
+    prev = latest_imports()
+    branches = latest_imports("branch")
+    plan: list[tuple[str, str, dict]] = []  # (action, thread, info)
+    for t, e in prev.items():
+        if not os.path.exists(e["path"]):
+            plan.append(("skip_missing", t, e))
+        elif not codex_changed_since(t, e.get("imported_at")):
+            plan.append(("unchanged", t, e))
+        elif session_is_open(e["session"]) or claude_only_turns(e["path"], e["session"]):
+            # never touch a chat that is open or was continued in Claude: give the new Codex history its own chat
+            why = "open" if session_is_open(e["session"]) else "continued in Claude"
+            fp = source_fingerprint(t)
+            have = branches.get(t, {}).get(fp)
+            if have and os.path.exists(have["path"]):
+                plan.append(("branch_unchanged", t, {**have, "why": why}))
+            else:
+                plan.append(("branch", t, {**e, "why": why, "fingerprint": fp}))
+        else:
+            plan.append(("update", t, e))
+    # new top-level threads in the projects that were imported before
+    for proj in sorted({e["cwd"] for e in prev.values()}):
+        a = argparse.Namespace(**{**vars(args), "threads": [], "project": proj, "all": False})
+        for t in select_threads(db, a):
+            if t not in prev:
+                plan.append(("import_new", t, {"cwd": proj, "title": db.get(t, {}).get("name") or t}))
+    counts = {}
+    for action, t, info in plan:
+        counts[action] = counts.get(action, 0) + 1
+    if args.plan:
+        for action, t, info in plan:
+            if action != "unchanged":
+                print(json.dumps({"action": action, "thread": t, "title": info.get("title"), "cwd": info.get("cwd")},
+                                 ensure_ascii=False))
+        log("plan: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        return
+    done = {"updated": 0, "imported": 0, "failed": 0}
+    done["branched"] = 0
+    for action, t, info in plan:
+        if action not in ("update", "import_new", "branch"):
+            continue
+        a = argparse.Namespace(**{**vars(args), "cwd": info["cwd"], "force": action == "update", "branch": None})
+        if action == "branch":
+            a.branch = {"fingerprint": info["fingerprint"], "of_session": info["session"], "of_title": info["title"]}
+        log(f"{action}: {info.get('title')}")
+        try:
+            res = convert(t, db, a, log)
+        except Exception as ex:
+            res = {"thread": t, "status": "error", "error": repr(ex)}
+        if res["status"] == "ok":
+            if args.desktop:
+                res["desktop"] = register_desktop(res, db.get(t, {}), a)
+            done[{"update": "updated", "import_new": "imported", "branch": "branched"}[action]] += 1
+            if action == "branch":  # retire earlier copies of this thread that nobody continued
+                for fp, old in branches.get(t, {}).items():
+                    if fp != info["fingerprint"] and os.path.exists(old["path"]) and \
+                            not session_is_open(old["session"]) and not claude_only_turns(old["path"], old["session"]):
+                        arch = Path(old["path"]).parent / "_archive"
+                        arch.mkdir(exist_ok=True)
+                        shutil.move(old["path"], str(arch / Path(old["path"]).name))
+                        res.setdefault("retired_copies", []).append(old["session"])
+        else:
+            done["failed"] += 1
+        res["action"] = action
+        print(json.dumps(res, ensure_ascii=False))
+    for action, t, info in plan:
+        if action.startswith("skip") or action == "branch_unchanged":
+            print(json.dumps({"action": action, "thread": t, "title": info.get("title"), "why": info.get("why")},
+                             ensure_ascii=False))
+    log(f"resync: updated {done['updated']}, imported {done['imported']}, branched {done['branched']}, "
+        f"failed {done['failed']}, unchanged {counts.get('unchanged', 0)}, "
+        f"branch copies already current {counts.get('branch_unchanged', 0)}, missing {counts.get('skip_missing', 0)}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("threads", nargs="*", help="Codex thread ids (default: use --project or --all)")
@@ -1217,15 +1372,22 @@ def main():
                     help="also list imported sessions in the Claude desktop app's sidebar (restart the app to see them)")
     ap.add_argument("--desktop-dir", help="override the desktop app's session index folder")
     ap.add_argument("--desktop-model", default="claude-opus-5-5", help="model the desktop app resumes with")
+    ap.add_argument("--resync", action="store_true",
+                    help="update earlier imports whose Codex thread changed (skipping open chats and chats "
+                         "continued in Claude) and import new threads in the same projects")
+    ap.add_argument("--plan", action="store_true", help="with --resync: only show what would happen")
     args = ap.parse_args()
-    if not (args.threads or args.project or args.all):
-        ap.error("give thread ids, --project or --all")
+    if not (args.threads or args.project or args.all or args.resync):
+        ap.error("give thread ids, --project, --all or --resync")
     args.version = args.version or detect_version()
     if not args.claude_bin:
         app = sorted((HOME / "Library/Application Support/Claude/claude-code").glob("*/claude.app/Contents/MacOS/claude"))
         args.claude_bin = str(app[-1]) if app else (shutil.which("claude") or "claude")
     log = lambda s: print(s, file=sys.stderr, flush=True)
     db = load_db()
+    if args.resync:
+        resync(db, args, log)
+        return
     ids = select_threads(db, args)
     if args.list:
         for t in ids:
