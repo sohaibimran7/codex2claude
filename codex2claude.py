@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
+PERMISSION_MODE = "default"  # set in main() from --permission-mode or the user's settings
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 NAMESPACE = uuid.UUID("6f1d3c2a-9b7e-4c55-8a1e-c0de2c1a0de0")  # stable ids => idempotent re-imports
@@ -872,6 +873,18 @@ def resolve_cwd(cwd: str | None, row: dict) -> str:
     return cwd
 
 
+PERMISSION_MODES = ("default", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions")
+
+
+def default_permission_mode() -> str:
+    """The user's own default (settings.json permissions.defaultMode), so imports behave like new chats."""
+    try:
+        mode = json.loads((CLAUDE_HOME / "settings.json").read_text()).get("permissions", {}).get("defaultMode")
+    except (OSError, ValueError, AttributeError):
+        mode = None
+    return mode if mode in PERMISSION_MODES else "default"
+
+
 def detect_version() -> str:
     try:
         vs = sorted((HOME / "Library/Application Support/Claude/claude-code").iterdir(),
@@ -908,7 +921,7 @@ def assemble(msgs: list[Msg], session_id: str, cwd: str, branch: str, version: s
             if len(content) == 1 and content[0]["type"] == "text":
                 content = content[0]["text"]
             r = {"parentUuid": prev, **base, "type": "user", "message": {"role": "user", "content": content},
-                 "uuid": u, "timestamp": ts, "permissionMode": "default"}
+                 "uuid": u, "timestamp": ts, "permissionMode": PERMISSION_MODE}
             if m.real_user:
                 r["promptId"] = str(uuid.uuid5(NAMESPACE, u))
         else:
@@ -1159,12 +1172,29 @@ def register_desktop(result: dict, row: dict, args) -> str | None:
     key = result["session"] if result.get("kind") == "branch" else result["thread"]
     sid = "local_" + str(uuid.uuid5(NAMESPACE, "desktop:" + key))
     path = folder / f"{sid}.json"
-    if path.exists() and not args.force:
-        return str(path)
+    if path.exists():
+        if not args.force:
+            return str(path)
+        # update only what the import owns; keep the mode and everything the app added
+        try:
+            old = json.loads(path.read_text())
+        except (OSError, ValueError):
+            old = None
+        if isinstance(old, dict):
+            backup = folder / "_codex2claude_backups"
+            backup.mkdir(exist_ok=True)
+            shutil.copy2(path, backup / f"{sid}.{datetime.now().strftime('%Y%m%d%H%M%S')}.json")
+            old.update(cliSessionId=result["session"], cwd=result["cwd"], originCwd=result["cwd"],
+                       title=result["title"], lastActivityAt=max(old.get("lastActivityAt") or 0,
+                                                                 row.get("updated_at_ms") or 0))
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(old))
+            os.replace(tmp, path)
+            return str(path)
     now = int(datetime.now().timestamp() * 1000)
     rec = {"sessionId": sid, "cliSessionId": result["session"], "cwd": result["cwd"], "originCwd": result["cwd"],
            "createdAt": row.get("created_at_ms") or now, "lastActivityAt": row.get("updated_at_ms") or now,
-           "isArchived": bool(row.get("archived")), "permissionMode": "default", "remoteMcpServersConfig": [],
+           "isArchived": bool(row.get("archived")), "permissionMode": PERMISSION_MODE, "remoteMcpServersConfig": [],
            "model": args.desktop_model, "title": result["title"], "titleSource": "user"}
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(rec))
@@ -1371,6 +1401,8 @@ def main():
     ap.add_argument("--desktop", action="store_true",
                     help="also list imported sessions in the Claude desktop app's sidebar (restart the app to see them)")
     ap.add_argument("--desktop-dir", help="override the desktop app's session index folder")
+    ap.add_argument("--permission-mode", choices=PERMISSION_MODES,
+                    help="permission mode for imported chats (default: your permissions.defaultMode setting)")
     ap.add_argument("--desktop-model", default="claude-opus-5-5", help="model the desktop app resumes with")
     ap.add_argument("--resync", action="store_true",
                     help="update earlier imports whose Codex thread changed (skipping open chats and chats "
@@ -1380,6 +1412,8 @@ def main():
     if not (args.threads or args.project or args.all or args.resync):
         ap.error("give thread ids, --project, --all or --resync")
     args.version = args.version or detect_version()
+    global PERMISSION_MODE
+    PERMISSION_MODE = args.permission_mode or default_permission_mode()
     if not args.claude_bin:
         app = sorted((HOME / "Library/Application Support/Claude/claude-code").glob("*/claude.app/Contents/MacOS/claude"))
         args.claude_bin = str(app[-1]) if app else (shutil.which("claude") or "claude")

@@ -55,6 +55,7 @@ Both modes replay the conversation since Codex's last compaction. If that part i
 - Forked threads link to their parent's transcript instead of copying the parent's history. Pass `--inherit full` to copy it anyway.
 - Codex worktree folders (`~/.codex/worktrees/<id>/<repo>`) are mapped back to the main checkout, and the summary tells Claude where Codex's files actually live.
 - Thread titles (`[Codex] <title>`), git branch, and timestamps.
+- Imported chats use your own default permission mode (`permissions.defaultMode` in `~/.claude/settings.json`), or `--permission-mode` if given. A resync never changes the mode of a chat that's already imported. It only updates the chat's title, transcript link, folder and last-activity time, and backs up the entry first.
 - Injected context (AGENTS.md, environment and permission blocks, developer instructions) is dropped. Claude Code supplies its own.
 - Subagent and guardian threads are skipped. Pass `--include-subagents` to import them.
 
